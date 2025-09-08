@@ -653,7 +653,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
         Audio Call — {displayName || "(no name)"} ({role})
       </h2>
 
-      {/* Connection status */}
+      {/* Connection status with mobile interaction prompt */}
       <div style={{ 
         padding: '10px', 
         backgroundColor: connectionStatus.includes('Connected') ? '#d4edda' : 
@@ -663,6 +663,27 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
         marginBottom: '10px' 
       }}>
         Status: {connectionStatus}
+        {connectionStatus.includes('failed') && (
+          <div style={{ marginTop: '5px' }}>
+            <button 
+              onClick={() => {
+                if (audioRef.current) {
+                  audioRef.current.play().catch(() => {});
+                }
+              }}
+              style={{
+                padding: '5px 10px',
+                backgroundColor: '#007bff',
+                color: 'white',
+                border: 'none',
+                borderRadius: '3px',
+                cursor: 'pointer'
+              }}
+            >
+              Click to enable audio (required on mobile)
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Single audio element used by both roles:
