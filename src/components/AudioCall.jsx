@@ -9,6 +9,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
   const [haveMedia, setHaveMedia] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(null);
   const [localStream, setLocalStream] = useState(null);
+  const [connectionStatus, setConnectionStatus] = useState("Connecting...");
 
   // Student: single RTCPeerConnection
   const pcRef = useRef(null);
@@ -112,6 +113,9 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
     const setup = async () => {
       try {
         console.log("AudioCall setup:", { displayName, roomId, role });
+        setConnectionStatus("Getting microphone access...");
+
+        // 1. Get media first
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             sampleSize: 16,
@@ -129,31 +133,71 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
         setLocalStream(stream);
         setHaveMedia(true);
         setAudioEnabled(true);
+        setConnectionStatus("Connecting to server...");
 
-        // connect socket
+        // 2. Setup socket connection
         const socket = socketConnection(displayName, roomId);
         socketRef.current = socket;
 
+        // 3. Setup ALL event handlers BEFORE any operations
         socket.on("connect", () => {
           console.log("socket connected", socket.id);
         });
+        
         socket.on("disconnect", (reason) => {
           console.log("socket disconnected", reason);
+          setConnectionStatus("Disconnected");
         });
 
-        // join/create room
-        if (role === "teacher") socket.emit("createRoom", { roomId });
-        else socket.emit("joinRoom", { roomId });
+        // 4. Wait for socket connection
+        await new Promise((resolve, reject) => {
+          if (socket.connected) {
+            resolve();
+          } else {
+            socket.on("connect", resolve);
+            socket.on("connect_error", reject);
+            setTimeout(() => reject(new Error("Connection timeout")), 10000);
+          }
+        });
 
-        // --- STUDENT FLOW ---
+        setConnectionStatus("Joining room...");
+
+        // 5. Wait for room join/create with proper acknowledgment
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error("Room operation timeout")), 10000);
+          
+          if (role === "teacher") {
+            socket.emit("createRoom", { roomId }, (response) => {
+              clearTimeout(timeout);
+              if (response && response.success !== false) {
+                console.log("Room created successfully");
+                resolve();
+              } else {
+                reject(new Error("Failed to create room"));
+              }
+            });
+          } else {
+            socket.emit("joinRoom", { roomId }, (response) => {
+              clearTimeout(timeout);
+              if (response && response.success !== false) {
+                console.log("Room joined successfully");
+                resolve();
+              } else {
+                reject(new Error("Failed to join room"));
+              }
+            });
+          }
+        });
+
+        setConnectionStatus("Setting up audio connection...");
+
+        // 6. Now setup WebRTC - all handlers are in place, room is confirmed
         if (role !== "teacher") {
+          // --- STUDENT FLOW ---
           const pc = new RTCPeerConnection(peerConfiguration);
           pcRef.current = pc;
 
-          // add local (student) tracks
-          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
-
-          // remote track: teacher's audio (may be multiple tracks)
+          // Setup all PC event handlers before any operations
           pc.ontrack = (ev) => {
             try {
               console.log("student: ontrack", ev);
@@ -198,6 +242,16 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             }
           };
 
+          pc.onconnectionstatechange = () => {
+            console.log("Student PC connection state:", pc.connectionState);
+            if (pc.connectionState === "connected") {
+              setConnectionStatus("Connected");
+            } else if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+              setConnectionStatus("Connection failed");
+            }
+          };
+
+          // Setup socket handlers for student
           socket.on("answerResponse", async (entireOffer) => {
             if (!pcRef.current) return;
             if (entireOffer.answer) {
@@ -234,20 +288,34 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             }
           });
 
-          // create and send offer (student is offerer)
+          // Add local tracks to PC
+          stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+          // Now create and send offer (everything is ready)
           if (pc.signalingState === "stable") {
             try {
               const offer = await pc.createOffer();
               await pc.setLocalDescription(offer);
-              socket.emit("newOffer", offer, (ack) => {
-                console.log("student: offer sent ack", ack);
+              
+              // Wait for offer to be sent successfully
+              await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error("Offer send timeout")), 10000);
+                socket.emit("newOffer", offer, (ack) => {
+                  clearTimeout(timeout);
+                  console.log("student: offer sent ack", ack);
+                  resolve();
+                });
               });
+              
+              setConnectionStatus("Waiting for teacher response...");
             } catch (err) {
               console.warn("student createOffer error", err);
+              setConnectionStatus("Failed to send offer");
             }
           }
         } else {
           // --- TEACHER FLOW ---
+          setConnectionStatus("Ready - waiting for students...");
 
           // helper to create a pc for a particular student socket id
           const createPcForStudent = (studentSocketId) => {
@@ -367,7 +435,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             return pc;
           };
 
-          // handle full offers list — answer new ones
+          // Setup all socket handlers for teacher
           socket.on("availableOffers", async (offers = []) => {
             for (const offer of offers) {
               try {
@@ -412,7 +480,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             }
           });
 
-          // when a new single offer arrives targeted to teacher
           socket.on("newOfferAwaiting", async (recentOffers) => {
             for (const offerObj of recentOffers) {
               if (!offerObj || offerObj.answer) continue;
@@ -464,7 +531,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             }
           });
 
-          // received ICE candidate forwarded by server
           socket.on("receivedIceCandidateFromServer", async (payload) => {
             if (!payload) return;
             const from = payload.fromSocketId;
@@ -481,9 +547,10 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             }
           });
 
-          // room closed
           socket.on("roomClosed", ({ reason }) => {
             console.log("roomClosed", reason);
+            setConnectionStatus("Room closed");
+            
             // remove all student tracks
             Object.keys(studentTracksRef.current).forEach((id) => {
               (studentTracksRef.current[id] || []).forEach((t) => {
@@ -494,6 +561,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
               });
             });
             studentTracksRef.current = {};
+            
             // close all pcs
             Object.keys(pcsRef.current).forEach((k) => {
               try {
@@ -503,6 +571,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             });
             pcsRef.current = {};
             forwardedSendersRef.current = {};
+            
             // clear shared stream
             try {
               sharedStreamRef.current.getTracks().forEach((t) => t.stop?.());
@@ -512,7 +581,8 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
           });
         }
       } catch (err) {
-        console.error("getUserMedia / setup failed:", err);
+        console.error("Setup failed:", err);
+        setConnectionStatus(`Error: ${err.message}`);
       }
     };
 
@@ -582,6 +652,18 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
       <h2>
         Audio Call — {displayName || "(no name)"} ({role})
       </h2>
+
+      {/* Connection status */}
+      <div style={{ 
+        padding: '10px', 
+        backgroundColor: connectionStatus.includes('Connected') ? '#d4edda' : 
+                        connectionStatus.includes('Error') || connectionStatus.includes('Failed') ? '#f8d7da' : '#fff3cd',
+        border: '1px solid #ccc',
+        borderRadius: '4px',
+        marginBottom: '10px' 
+      }}>
+        Status: {connectionStatus}
+      </div>
 
       {/* Single audio element used by both roles:
           - Student: plays teacher stream (teacher sends teacher mic + forwarded student tracks)
