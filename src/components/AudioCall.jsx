@@ -19,13 +19,95 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
   // Single audio element used for either: student plays teacher stream OR teacher plays mixed student stream
   const audioRef = useRef(null);
 
-  // Shared stream for teacher to mix all student tracks into one element
+  // Shared stream for teacher to combine all student tracks into one element (teacher hears everyone)
   const sharedStreamRef = useRef(new MediaStream());
   // Map to track which tracks came from which student (for removal on disconnect)
   const studentTracksRef = useRef({}); // { [studentSocketId]: MediaStreamTrack[] }
 
+  // Map for forwarded senders: trackId -> { [toStudentId]: RTCRtpSender }
+  const forwardedSendersRef = useRef({});
+
   useEffect(() => {
     let mounted = true;
+
+    // Forward a track to a particular student's pc (teacher -> that student)
+    const forwardTrackToPc = (track, fromStudentId, toStudentId) => {
+      try {
+        const pc = pcsRef.current[toStudentId];
+        if (!pc) return null;
+        forwardedSendersRef.current[track.id] = forwardedSendersRef.current[track.id] || {};
+        if (forwardedSendersRef.current[track.id][toStudentId]) {
+          // already forwarded
+          return forwardedSendersRef.current[track.id][toStudentId];
+        }
+        // Add track to the PC (wrap in a MediaStream)
+        const sender = pc.addTrack(track, new MediaStream([track]));
+        forwardedSendersRef.current[track.id][toStudentId] = sender;
+        console.log(`Teacher: forwarded track ${track.id} from ${fromStudentId} -> pc[${toStudentId}]`);
+        return sender;
+      } catch (e) {
+        console.warn("forwardTrackToPc error", e);
+        return null;
+      }
+    };
+
+    // Forward a track to all students except the origin
+    const forwardTrackToAllExcept = (fromStudentId, track) => {
+      Object.keys(pcsRef.current).forEach((targetId) => {
+        if (targetId === fromStudentId) return;
+        forwardTrackToPc(track, fromStudentId, targetId);
+      });
+    };
+
+    // Remove all forwarded senders for a specific track
+    const removeForwardedTrack = (track) => {
+      try {
+        const map = forwardedSendersRef.current[track.id] || {};
+        Object.entries(map).forEach(([toId, sender]) => {
+          try {
+            const pc = pcsRef.current[toId];
+            if (pc && sender) {
+              pc.removeTrack(sender);
+              console.log(`Teacher: removed forwarded sender for track ${track.id} from pc[${toId}]`);
+            }
+          } catch (e) {
+            // swallow
+          }
+        });
+        delete forwardedSendersRef.current[track.id];
+      } catch (e) {
+        console.warn("removeForwardedTrack error", e);
+      }
+    };
+
+    // Remove all tracks for a student: from sharedStream and forwarded copies
+    const removeStudentTracks = (id) => {
+      try {
+        const tracks = studentTracksRef.current[id];
+        if (!tracks || !sharedStreamRef.current) return;
+        tracks.forEach((t) => {
+          try {
+            // remove from teacher's shared stream
+            const existing = sharedStreamRef.current.getTracks().find((x) => x.id === t.id);
+            if (existing) sharedStreamRef.current.removeTrack(existing);
+          } catch (e) {}
+          // remove forwarded copies
+          try {
+            removeForwardedTrack(t);
+          } catch (e) {}
+          // stop track if desired (not strictly necessary)
+          try { t.stop?.(); } catch (e) {}
+        });
+        delete studentTracksRef.current[id];
+        // reconnect teacher audio element to updated shared stream
+        try {
+          if (audioRef.current) audioRef.current.srcObject = sharedStreamRef.current;
+        } catch (e) {}
+        console.log("Teacher: removed studentTracks for", id);
+      } catch (e) {
+        console.warn("removeStudentTracks error", e);
+      }
+    };
 
     const setup = async () => {
       try {
@@ -71,23 +153,39 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
           // add local (student) tracks
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-          // remote track: teacher's audio
+          // remote track: teacher's audio (may be multiple tracks)
           pc.ontrack = (ev) => {
-            const el = audioRef.current;
-            if (!el) return;
-            if (ev.streams && ev.streams[0]) {
-              el.srcObject = ev.streams[0];
-            } else {
-              if (!el.srcObject) el.srcObject = new MediaStream();
-              try {
-                el.srcObject.addTrack(ev.track);
-              } catch (e) {
-                console.warn("student addTrack fallback:", e);
+            try {
+              console.log("student: ontrack", ev);
+              const el = audioRef.current;
+              if (!el) return;
+
+              // prefer attached stream
+              if (ev.streams && ev.streams[0]) {
+                el.srcObject = ev.streams[0];
+              } else {
+                if (!el.srcObject) el.srcObject = new MediaStream();
+                try {
+                  el.srcObject.addTrack(ev.track);
+                } catch (e) {
+                  console.warn("student addTrack fallback:", e);
+                }
               }
+
+              // robust play attempt
+              el.play().catch(async (err) => {
+                console.warn("student audio autoplay blocked or failed:", err);
+                try {
+                  el.muted = true;
+                  await el.play();
+                  setTimeout(() => { try { el.muted = false; } catch {} }, 250);
+                } catch (e) {
+                  console.warn("student muted autoplay also failed", e);
+                }
+              });
+            } catch (e) {
+              console.warn("student ontrack overall error", e);
             }
-            el.play().catch((err) => {
-              console.warn("student audio autoplay blocked or failed:", err);
-            });
           };
 
           pc.onicecandidate = (event) => {
@@ -151,21 +249,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
         } else {
           // --- TEACHER FLOW ---
 
-          // remove all tracks for a specific student from shared stream
-          const removeStudentTracks = (id) => {
-            const tracks = studentTracksRef.current[id];
-            if (!tracks || !sharedStreamRef.current) return;
-            tracks.forEach((t) => {
-              try {
-                sharedStreamRef.current.removeTrack(t);
-                // optionally stop the track: t.stop?.();
-              } catch (e) {
-                console.warn("removeStudentTracks error", e);
-              }
-            });
-            delete studentTracksRef.current[id];
-          };
-
           // helper to create a pc for a particular student socket id
           const createPcForStudent = (studentSocketId) => {
             if (pcsRef.current[studentSocketId])
@@ -174,8 +257,33 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             const pc = new RTCPeerConnection(peerConfiguration);
             pcsRef.current[studentSocketId] = pc;
 
-            // add teacher's local mic tracks to each pc
-            stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+            // add teacher's local mic tracks to each pc (so students hear teacher)
+            stream.getTracks().forEach((track) => {
+              try {
+                // avoid adding duplicates
+                const exists = pc.getSenders().some((s) => s.track && s.track.id === track.id);
+                if (!exists) pc.addTrack(track, stream);
+              } catch (e) {
+                console.warn("teacher addTrack (teacher mic) failed for", studentSocketId, e);
+              }
+            });
+
+            // If there are already student tracks collected (other students), forward them into this new PC
+            Object.entries(studentTracksRef.current).forEach(([fromId, tracks]) => {
+              if (fromId === studentSocketId) return;
+              (tracks || []).forEach((t) => {
+                try {
+                  forwardedSendersRef.current[t.id] = forwardedSendersRef.current[t.id] || {};
+                  if (!forwardedSendersRef.current[t.id][studentSocketId]) {
+                    const sender = pc.addTrack(t, new MediaStream([t]));
+                    forwardedSendersRef.current[t.id][studentSocketId] = sender;
+                    console.log(`Teacher: forwarded existing track ${t.id} from ${fromId} -> new pc[${studentSocketId}]`);
+                  }
+                } catch (e) {
+                  console.warn("teacher forward existing track error", e);
+                }
+              });
+            });
 
             pc.ontrack = (ev) => {
               console.log("teacher: ontrack from student", studentSocketId, ev);
@@ -189,6 +297,9 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                     studentTracksRef.current[studentSocketId] =
                       studentTracksRef.current[studentSocketId] || [];
                     studentTracksRef.current[studentSocketId].push(incomingTrack);
+
+                    // forward this incoming track to all other student PCs
+                    forwardTrackToAllExcept(studentSocketId, incomingTrack);
                   }
                 });
               } else {
@@ -198,10 +309,13 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                   studentTracksRef.current[studentSocketId] =
                     studentTracksRef.current[studentSocketId] || [];
                   studentTracksRef.current[studentSocketId].push(t);
+
+                  // forward this incoming track to all other student PCs
+                  forwardTrackToAllExcept(studentSocketId, t);
                 }
               }
 
-              // attach the combined shared stream to the single audio element
+              // attach the combined shared stream to the single audio element (teacher hears)
               if (audioRef.current) {
                 audioRef.current.srcObject = shared;
                 audioRef.current.play().catch((err) => {
@@ -232,7 +346,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                 pc.connectionState === "failed" ||
                 pc.connectionState === "closed"
               ) {
-                // cleanup that student's tracks
+                // cleanup that student's tracks and forwarded senders
                 try {
                   removeStudentTracks(studentSocketId);
                 } catch (e) {}
@@ -266,6 +380,11 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                 if (pc.signalingState === "have-remote-offer") {
                   const answer = await pc.createAnswer();
                   await pc.setLocalDescription(answer);
+
+                  // debug log of senders
+                  try {
+                    console.log("Teacher: pc.getSenders()", offer.offererSocketId, pc.getSenders().map(s => ({ id: s.track?.id, kind: s.track?.kind })));
+                  } catch (e) {}
 
                   socket.emit(
                     "newAnswer",
@@ -309,6 +428,11 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                 if (pc.signalingState === "have-remote-offer") {
                   const answer = await pc.createAnswer();
                   await pc.setLocalDescription(answer);
+
+                  // debug senders
+                  try {
+                    console.log("Teacher: pc.getSenders()", student, pc.getSenders().map(s => ({ id: s.track?.id, kind: s.track?.kind })));
+                  } catch (e) {}
 
                   socket.emit(
                     "newAnswer",
@@ -365,8 +489,8 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
               (studentTracksRef.current[id] || []).forEach((t) => {
                 try {
                   sharedStreamRef.current.removeTrack(t);
-                  // t.stop?.();
                 } catch (e) {}
+                try { removeForwardedTrack(t); } catch (e) {}
               });
             });
             studentTracksRef.current = {};
@@ -378,6 +502,13 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
               } catch {}
             });
             pcsRef.current = {};
+            forwardedSendersRef.current = {};
+            // clear shared stream
+            try {
+              sharedStreamRef.current.getTracks().forEach((t) => t.stop?.());
+            } catch {}
+            sharedStreamRef.current = new MediaStream();
+            if (audioRef.current) audioRef.current.srcObject = null;
           });
         }
       } catch (err) {
@@ -411,16 +542,18 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
         } catch {}
       });
 
-      // remove and stop all student tracks from shared stream
+      // remove and stop all student tracks from shared stream and forwarded copies
       Object.keys(studentTracksRef.current).forEach((id) => {
         (studentTracksRef.current[id] || []).forEach((t) => {
           try {
             sharedStreamRef.current.removeTrack(t);
-            t.stop?.();
           } catch (e) {}
+          try { removeForwardedTrack(t); } catch (e) {}
+          try { t.stop?.(); } catch (e) {}
         });
       });
       studentTracksRef.current = {};
+      forwardedSendersRef.current = {};
 
       // clear and stop shared stream tracks
       try {
@@ -451,32 +584,12 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
       </h2>
 
       {/* Single audio element used by both roles:
-          - Student: plays teacher stream
-          - Teacher: plays mixed student stream (sharedStreamRef is attached in ontrack) */}
+          - Student: plays teacher stream (teacher sends teacher mic + forwarded student tracks)
+          - Teacher: plays combined sharedStream of incoming student tracks + teacher mic */}
       <audio ref={audioRef} autoPlay playsInline controls />
 
       {/* Action buttons */}
       <ActionButtons localStream={localStream} toggleAudio={toggleAudio} />
-
-      {/* Teacher-only button: single user gesture to satisfy autoplay policies */}
-      {role === "teacher" && (
-        <div style={{ marginTop: 8 }}>
-          <button
-            onClick={() => {
-              // unmute + try to play the shared audio element
-              try {
-                const a = audioRef.current;
-                if (a) {
-                  a.muted = false;
-                  a.play().catch(() => {});
-                }
-              } catch {}
-            }}
-          >
-            Enable student audio (click once)
-          </button>
-        </div>
-      )}
 
       <div style={{ marginTop: 10 }}>
         <div>Room: {roomId}</div>

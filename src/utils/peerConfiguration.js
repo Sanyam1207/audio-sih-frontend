@@ -2,13 +2,30 @@
 // utils/peerConfiguration.js
 const peerConfiguration = {
   iceServers: [
-    { urls: [
-      'stun:stun.l.google.com:19302',
-      'stun:stun1.l.google.com:19302'
-    ]}
-  ],
-  bundlePolicy: "max-bundle",
-  rtcpMuxPolicy: "require"
+    {
+      urls: "stun:stun.relay.metered.ca:80"
+    },
+    {
+      urls: "turn:asia.relay.metered.ca:80",
+      username: "72f03df1b6a58f38d7fd81ab",
+      credential: "guctVzh/8qDU4KU0"
+    },
+    {
+      urls: "turn:asia.relay.metered.ca:80?transport=tcp",
+      username: "72f03df1b6a58f38d7fd81ab",
+      credential: "guctVzh/8qDU4KU0"
+    },
+    {
+      urls: "turn:asia.relay.metered.ca:443",
+      username: "72f03df1b6a58f38d7fd81ab",
+      credential: "guctVzh/8qDU4KU0"
+    },
+    {
+      urls: "turns:asia.relay.metered.ca:443?transport=tcp",
+      username: "72f03df1b6a58f38d7fd81ab",
+      credential: "guctVzh/8qDU4KU0"
+    }
+  ]
 };
 
 export default peerConfiguration;
