@@ -25,7 +25,8 @@ const peerConfiguration = {
       username: "72f03df1b6a58f38d7fd81ab",
       credential: "guctVzh/8qDU4KU0"
     }
-  ]
+  ],
+   iceTransportPolicy: "all"
 };
 
 export default peerConfiguration;

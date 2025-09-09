@@ -133,6 +133,35 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
         setLocalStream(stream);
         setHaveMedia(true);
         setAudioEnabled(true);
+        // Test TURN server connectivity before proceeding
+        console.log("Testing TURN server connectivity...");
+        const testPc = new RTCPeerConnection(peerConfiguration);
+        testPc.createDataChannel("test");
+        
+        let turnServerWorking = false;
+        testPc.onicecandidate = (event) => {
+          if (event.candidate && event.candidate.type === 'relay') {
+            console.log("✅ TURN server is working - relay candidate found");
+            turnServerWorking = true;
+          }
+        };
+        
+        try {
+          const testOffer = await testPc.createOffer();
+          await testPc.setLocalDescription(testOffer);
+          
+          // Wait 5 seconds to see if we get relay candidates
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          
+          if (!turnServerWorking) {
+            console.warn("⚠️ TURN server might not be working - no relay candidates found");
+            setConnectionStatus("Warning: TURN server connection issue detected");
+          }
+        } catch (e) {
+          console.warn("TURN test failed:", e);
+        }
+        
+        testPc.close();
         setConnectionStatus("Connecting to server...");
 
         // 2. Setup socket connection
