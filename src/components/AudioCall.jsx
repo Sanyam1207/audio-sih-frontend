@@ -1,3 +1,5 @@
+// chalrha h 
+// components/AudioCall.jsx
 import { useEffect, useRef, useState } from "react";
 import socketConnection from "../utils/socketConnection";
 import peerConfiguration from "../utils/peerConfiguration";
@@ -26,6 +28,39 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
 
   // Map for forwarded senders: trackId -> { [toStudentId]: RTCRtpSender }
   const forwardedSendersRef = useRef({});
+
+
+  const createMixedTrack = (studentTrack, teacherTrack) => {
+    try {
+      // Create audio context for mixing
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+      // Create source nodes for both tracks
+      const studentSource = audioContext.createMediaStreamSource(new MediaStream([studentTrack]));
+      const teacherSource = audioContext.createMediaStreamSource(new MediaStream([teacherTrack]));
+
+      // Create gain nodes to control volume (optional - you can adjust these)
+      const studentGain = audioContext.createGain();
+      const teacherGain = audioContext.createGain();
+      studentGain.gain.value = 0.7; // Student at 70% volume
+      teacherGain.gain.value = 0.5;  // Teacher at 50% volume
+
+      // Create destination for mixed output
+      const destination = audioContext.createMediaStreamDestination();
+
+      // Connect the audio graph: sources -> gains -> destination
+      studentSource.connect(studentGain);
+      teacherSource.connect(teacherGain);
+      studentGain.connect(destination);
+      teacherGain.connect(destination);
+
+      // Return the mixed track
+      return destination.stream.getAudioTracks()[0];
+    } catch (error) {
+      console.warn("Audio mixing failed, falling back to student track only:", error);
+      return studentTrack; // Fallback to original student track
+    }
+  };
 
 
   useEffect(() => {
@@ -382,36 +417,53 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
               });
             });
 
-            // *** MODIFIED AND SIMPLIFIED LOGIC ***
             pc.ontrack = (ev) => {
               console.log("teacher: ontrack from student", studentSocketId, ev);
               const shared = sharedStreamRef.current;
-              const incomingTrack = ev.track;
 
-              // Ensure we have a track and haven't processed it before
-              if (!incomingTrack || shared.getTracks().some(t => t.id === incomingTrack.id)) {
-                return;
+              // prefer full stream if provided
+              if (ev.streams && ev.streams[0]) {
+                ev.streams[0].getTracks().forEach((incomingTrack) => {
+                  if (!shared.getTracks().find((t) => t.id === incomingTrack.id)) {
+                    shared.addTrack(incomingTrack);
+                    studentTracksRef.current[studentSocketId] =
+                      studentTracksRef.current[studentSocketId] || [];
+                    studentTracksRef.current[studentSocketId].push(incomingTrack);
+
+                    // Create mixed track: student + teacher audio
+                    const mixedTrack = createMixedTrack(incomingTrack, stream.getAudioTracks()[0]);
+
+                    // forward the MIXED track to all other student PCs
+                    Object.keys(pcsRef.current).forEach((targetId) => {
+                      if (targetId === studentSocketId) return;
+                      forwardTrackToPc(mixedTrack, studentSocketId, targetId);
+                    });
+                  }
+                });
+              } else {
+                const t = ev.track;
+                if (t && !shared.getTracks().find((x) => x.id === t.id)) {
+                  shared.addTrack(t);
+                  studentTracksRef.current[studentSocketId] =
+                    studentTracksRef.current[studentSocketId] || [];
+                  studentTracksRef.current[studentSocketId].push(t);
+
+                  // Create mixed track: student + teacher audio
+                  const mixedTrack = createMixedTrack(t, stream.getAudioTracks()[0]);
+
+                  // forward the MIXED track to all other student PCs
+                  Object.keys(pcsRef.current).forEach((targetId) => {
+                    if (targetId === studentSocketId) return;
+                    forwardTrackToPc(mixedTrack, studentSocketId, targetId);
+                  });
+                }
               }
 
-              // 1. Add student's track to the teacher's shared stream so the teacher can hear them.
-              shared.addTrack(incomingTrack);
-
-              // Store a reference to this track for cleanup later.
-              studentTracksRef.current[studentSocketId] = studentTracksRef.current[studentSocketId] || [];
-              studentTracksRef.current[studentSocketId].push(incomingTrack);
-              console.log(`Teacher: received track ${incomingTrack.id} from ${studentSocketId}. Added to local playback.`);
-
-              // 2. Forward this incoming student track to all OTHER students.
-              // Each student already receives the teacher's main audio track separately,
-              // so we just forward this peer's track to allow students to hear each other.
-              forwardTrackToAllExcept(studentSocketId, incomingTrack);
-              console.log(`Teacher: Forwarding track ${incomingTrack.id} to all other students.`);
-
-              // 3. Update the teacher's audio element to play the combined stream.
+              // attach the combined shared stream to the single audio element (teacher hears)
               if (audioRef.current) {
                 audioRef.current.srcObject = shared;
                 audioRef.current.play().catch((err) => {
-                  console.warn("Autoplay blocked for teacher's shared audio:", err);
+                  console.warn("Autoplay blocked for shared audio:", err);
                 });
               }
             };
@@ -713,7 +765,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
 
       {/* Single audio element used by both roles:
           - Student: plays teacher stream (teacher sends teacher mic + forwarded student tracks)
-          - Teacher: plays combined sharedStream of incoming student tracks */}
+          - Teacher: plays combined sharedStream of incoming student tracks + teacher mic */}
       <audio ref={audioRef} autoPlay playsInline controls />
 
       {/* Action buttons */}
@@ -729,4 +781,3 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
 };
 
 export default AudioCall;
-
