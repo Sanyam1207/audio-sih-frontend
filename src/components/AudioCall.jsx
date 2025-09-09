@@ -29,95 +29,35 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
   const forwardedSendersRef = useRef({});
 
 
-  // Single shared audio context for all mixing operations
-  const audioContextRef = useRef(null);
-  const mixingNodesRef = useRef({}); // Store mixing nodes for cleanup
-
-  // Initialize audio context once
-  const getAudioContext = () => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    return audioContextRef.current;
-  };
-
-
-  const createMixedTrack = (studentTrack, teacherTrack, studentSocketId) => {
+  const createMixedTrack = (studentTrack, teacherTrack) => {
     try {
-      if (!teacherTrack || !studentTrack) {
-        console.warn("Missing tracks for mixing, returning student track");
-        return studentTrack;
-      }
+      // Create audio context for mixing
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
-      const audioContext = getAudioContext();
-
-      // Clean up any existing mixing nodes for this student
-      if (mixingNodesRef.current[studentSocketId]) {
-        try {
-          const nodes = mixingNodesRef.current[studentSocketId];
-          nodes.destination.disconnect();
-          nodes.studentSource.disconnect();
-          nodes.teacherSource.disconnect();
-          nodes.studentGain.disconnect();
-          nodes.teacherGain.disconnect();
-        } catch (e) {
-          console.warn("Error cleaning up old mixing nodes:", e);
-        }
-      }
-
-      // Create source nodes
+      // Create source nodes for both tracks
       const studentSource = audioContext.createMediaStreamSource(new MediaStream([studentTrack]));
       const teacherSource = audioContext.createMediaStreamSource(new MediaStream([teacherTrack]));
 
-      // Create gain nodes for volume control
+      // Create gain nodes to control volume (optional - you can adjust these)
       const studentGain = audioContext.createGain();
       const teacherGain = audioContext.createGain();
-      studentGain.gain.value = 0.8; // Student at 80% volume
-      teacherGain.gain.value = 0.4;  // Teacher at 40% volume (lower to avoid echo)
+      studentGain.gain.value = 0.7; // Student at 70% volume
+      teacherGain.gain.value = 0.5;  // Teacher at 50% volume
 
       // Create destination for mixed output
       const destination = audioContext.createMediaStreamDestination();
 
-      // Connect the audio graph
+      // Connect the audio graph: sources -> gains -> destination
       studentSource.connect(studentGain);
       teacherSource.connect(teacherGain);
       studentGain.connect(destination);
       teacherGain.connect(destination);
 
-      // Store references for cleanup
-      mixingNodesRef.current[studentSocketId] = {
-        studentSource,
-        teacherSource,
-        studentGain,
-        teacherGain,
-        destination
-      };
-
-      const mixedTrack = destination.stream.getAudioTracks()[0];
-      console.log(`Created mixed track for student ${studentSocketId}`);
-      return mixedTrack;
-
+      // Return the mixed track
+      return destination.stream.getAudioTracks()[0];
     } catch (error) {
       console.warn("Audio mixing failed, falling back to student track only:", error);
-      return studentTrack;
-    }
-  };
-
-
-  const cleanupMixingNodes = (studentSocketId) => {
-    if (mixingNodesRef.current[studentSocketId]) {
-      try {
-        const nodes = mixingNodesRef.current[studentSocketId];
-        nodes.destination.disconnect();
-        nodes.studentSource.disconnect();
-        nodes.teacherSource.disconnect();
-        nodes.studentGain.disconnect();
-        nodes.teacherGain.disconnect();
-        delete mixingNodesRef.current[studentSocketId];
-        console.log(`Cleaned up mixing nodes for student ${studentSocketId}`);
-      } catch (e) {
-        console.warn("Error during mixing nodes cleanup:", e);
-      }
+      return studentTrack; // Fallback to original student track
     }
   };
 
@@ -130,12 +70,12 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
       try {
         const pc = pcsRef.current[toStudentId];
         if (!pc) return null;
-
         forwardedSendersRef.current[track.id] = forwardedSendersRef.current[track.id] || {};
         if (forwardedSendersRef.current[track.id][toStudentId]) {
+          // already forwarded
           return forwardedSendersRef.current[track.id][toStudentId];
         }
-
+        // Add track to the PC (wrap in a MediaStream)
         const sender = pc.addTrack(track, new MediaStream([track]));
         forwardedSendersRef.current[track.id][toStudentId] = sender;
         console.log(`Teacher: forwarded track ${track.id} from ${fromStudentId} -> pc[${toStudentId}]`);
@@ -166,7 +106,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
               console.log(`Teacher: removed forwarded sender for track ${track.id} from pc[${toId}]`);
             }
           } catch (e) {
-            console.warn("removeTrack error:", e);
+            // swallow
           }
         });
         delete forwardedSendersRef.current[track.id];
@@ -178,31 +118,26 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
     // Remove all tracks for a student: from sharedStream and forwarded copies
     const removeStudentTracks = (id) => {
       try {
-        // Clean up mixing nodes first
-        cleanupMixingNodes(id);
-
         const tracks = studentTracksRef.current[id];
         if (!tracks || !sharedStreamRef.current) return;
-
         tracks.forEach((t) => {
           try {
+            // remove from teacher's shared stream
             const existing = sharedStreamRef.current.getTracks().find((x) => x.id === t.id);
             if (existing) sharedStreamRef.current.removeTrack(existing);
           } catch (e) { }
-
+          // remove forwarded copies
           try {
             removeForwardedTrack(t);
           } catch (e) { }
-
+          // stop track if desired (not strictly necessary)
           try { t.stop?.(); } catch (e) { }
         });
-
         delete studentTracksRef.current[id];
-
+        // reconnect teacher audio element to updated shared stream
         try {
           if (audioRef.current) audioRef.current.srcObject = sharedStreamRef.current;
         } catch (e) { }
-
         console.log("Teacher: removed studentTracks for", id);
       } catch (e) {
         console.warn("removeStudentTracks error", e);
@@ -288,8 +223,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
           }
         });
 
-        setConnectionStatus("Connecting to server...");
-        socketRef.current = socket;
+        setConnectionStatus("Joining room...");
 
         // 5. Wait for room join/create with proper acknowledgment
         await new Promise((resolve, reject) => {
@@ -485,43 +419,46 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             pc.ontrack = (ev) => {
               console.log("teacher: ontrack from student", studentSocketId, ev);
               const shared = sharedStreamRef.current;
-              const teacherTrack = stream.getAudioTracks()[0];
 
-              // Handle incoming tracks
-              const tracksToProcess = ev.streams && ev.streams[0]
-                ? ev.streams[0].getTracks()
-                : [ev.track];
+              // prefer full stream if provided
+              if (ev.streams && ev.streams[0]) {
+                ev.streams[0].getTracks().forEach((incomingTrack) => {
+                  if (!shared.getTracks().find((t) => t.id === incomingTrack.id)) {
+                    shared.addTrack(incomingTrack);
+                    studentTracksRef.current[studentSocketId] =
+                      studentTracksRef.current[studentSocketId] || [];
+                    studentTracksRef.current[studentSocketId].push(incomingTrack);
 
-              tracksToProcess.forEach((incomingTrack) => {
-                if (incomingTrack.kind !== 'audio') return;
+                    // Create mixed track: student + teacher audio
+                    const mixedTrack = createMixedTrack(incomingTrack, stream.getAudioTracks()[0]);
 
-                // Add to teacher's shared stream (teacher hears original student audio)
-                if (!shared.getTracks().find((t) => t.id === incomingTrack.id)) {
-                  shared.addTrack(incomingTrack);
-                  studentTracksRef.current[studentSocketId] =
-                    studentTracksRef.current[studentSocketId] || [];
-                  studentTracksRef.current[studentSocketId].push(incomingTrack);
-
-                  // Create mixed track for forwarding to other students
-                  if (teacherTrack) {
-                    const mixedTrack = createMixedTrack(incomingTrack, teacherTrack, studentSocketId);
-
-                    // Forward mixed track to all other students
+                    // forward the MIXED track to all other student PCs
                     Object.keys(pcsRef.current).forEach((targetId) => {
                       if (targetId === studentSocketId) return;
                       forwardTrackToPc(mixedTrack, studentSocketId, targetId);
                     });
-                  } else {
-                    // Fallback: forward original track if no teacher track available
-                    Object.keys(pcsRef.current).forEach((targetId) => {
-                      if (targetId === studentSocketId) return;
-                      forwardTrackToPc(incomingTrack, studentSocketId, targetId);
-                    });
                   }
-                }
-              });
+                });
+              } else {
+                const t = ev.track;
+                if (t && !shared.getTracks().find((x) => x.id === t.id)) {
+                  shared.addTrack(t);
+                  studentTracksRef.current[studentSocketId] =
+                    studentTracksRef.current[studentSocketId] || [];
+                  studentTracksRef.current[studentSocketId].push(t);
 
-              // Update teacher's audio element
+                  // Create mixed track: student + teacher audio
+                  const mixedTrack = createMixedTrack(t, stream.getAudioTracks()[0]);
+
+                  // forward the MIXED track to all other student PCs
+                  Object.keys(pcsRef.current).forEach((targetId) => {
+                    if (targetId === studentSocketId) return;
+                    forwardTrackToPc(mixedTrack, studentSocketId, targetId);
+                  });
+                }
+              }
+
+              // attach the combined shared stream to the single audio element (teacher hears)
               if (audioRef.current) {
                 audioRef.current.srcObject = shared;
                 audioRef.current.play().catch((err) => {
@@ -529,8 +466,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                 });
               }
             };
-
-            // [Rest of pc event handlers remain the same...]
 
 
             pc.onicecandidate = (event) => {
@@ -731,16 +666,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
 
     return () => {
       mounted = false;
-
-      Object.keys(mixingNodesRef.current).forEach(cleanupMixingNodes);
-      if (audioContextRef.current) {
-        try {
-          audioContextRef.current.close();
-        } catch (e) {
-          console.warn("Error closing audio context:", e);
-        }
-      }
-
       if (socketRef.current) {
         socketRef.current.off("availableOffers");
         socketRef.current.off("newOfferAwaiting");
