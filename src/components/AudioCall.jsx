@@ -1,3 +1,4 @@
+// chalrha h 
 // components/AudioCall.jsx
 import { useEffect, useRef, useState } from "react";
 import socketConnection from "../utils/socketConnection";
@@ -28,8 +29,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
   // Map for forwarded senders: trackId -> { [toStudentId]: RTCRtpSender }
   const forwardedSendersRef = useRef({});
 
-  // VAD (voice activity detection) monitors per originalTrackId
-  const vadMonitorsRef = useRef({}); // { [trackId]: { stop: fn, speaking: bool, studentId } }
 
   const createMixedTrack = (studentTrack, teacherTrack) => {
     try {
@@ -63,6 +62,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
     }
   };
 
+
   useEffect(() => {
     let mounted = true;
 
@@ -76,17 +76,9 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
           // already forwarded
           return forwardedSendersRef.current[track.id][toStudentId];
         }
-
-        // Clone the track so each RTCPeerConnection has its own sender/track instance.
-        // Cloning avoids potential issues with adding the same MediaStreamTrack to multiple PCs.
-        const cloned = track.clone ? track.clone() : track;
-
-        const sender = pc.addTrack(cloned, new MediaStream([cloned]));
+        // Add track to the PC (wrap in a MediaStream)
+        const sender = pc.addTrack(track, new MediaStream([track]));
         forwardedSendersRef.current[track.id][toStudentId] = sender;
-
-        // store a reference so we can stop the cloned track when removed
-        sender.__isClonedTrack = true;
-
         console.log(`Teacher: forwarded track ${track.id} from ${fromStudentId} -> pc[${toStudentId}]`);
         return sender;
       } catch (e) {
@@ -103,7 +95,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
       });
     };
 
-    // Remove all forwarded senders for a specific original track
+    // Remove all forwarded senders for a specific track
     const removeForwardedTrack = (track) => {
       try {
         const map = forwardedSendersRef.current[track.id] || {};
@@ -111,14 +103,7 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
           try {
             const pc = pcsRef.current[toId];
             if (pc && sender) {
-              try { pc.removeTrack(sender); } catch (e) { }
-
-              // stop cloned track if we created one
-              try {
-                const sentTrack = sender.track;
-                if (sentTrack && sentTrack.stop && sender.__isClonedTrack) sentTrack.stop();
-              } catch (e) { }
-
+              pc.removeTrack(sender);
               console.log(`Teacher: removed forwarded sender for track ${track.id} from pc[${toId}]`);
             }
           } catch (e) {
@@ -148,13 +133,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
           } catch (e) { }
           // stop track if desired (not strictly necessary)
           try { t.stop?.(); } catch (e) { }
-
-          // stop any VAD monitor for this original track
-          try {
-            const monitor = vadMonitorsRef.current[t.id];
-            if (monitor && monitor.stop) monitor.stop();
-            delete vadMonitorsRef.current[t.id];
-          } catch (e) { }
         });
         delete studentTracksRef.current[id];
         // reconnect teacher audio element to updated shared stream
@@ -165,94 +143,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
       } catch (e) {
         console.warn("removeStudentTracks error", e);
       }
-    };
-
-    // VAD monitor: watches a MediaStreamTrack's loudness and forwards when speaking
-    const monitorSpeaking = (origTrack, studentSocketId) => {
-      if (!origTrack || !origTrack.clone) return; // cannot monitor
-      if (vadMonitorsRef.current[origTrack.id]) return; // already monitoring
-
-      let running = true;
-      let speaking = false;
-      let silenceStart = 0;
-
-      // Create audio context and analyser
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const srcStream = new MediaStream([origTrack]);
-      const source = audioContext.createMediaStreamSource(srcStream);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 2048;
-      source.connect(analyser);
-
-      const data = new Float32Array(analyser.fftSize);
-
-      const RMS_THRESHOLD = 0.015; // adjustable threshold
-      const SILENCE_TIMEOUT = 800; // ms of silence to consider stopped speaking
-      const POLL_INTERVAL = 150; // ms
-
-      const loop = async () => {
-        while (running) {
-          try {
-            analyser.getFloatTimeDomainData(data);
-            // compute RMS
-            let sum = 0;
-            for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-            const rms = Math.sqrt(sum / data.length);
-
-            const now = Date.now();
-            if (rms > RMS_THRESHOLD) {
-              // detected speech
-              if (!speaking) {
-                speaking = true;
-                silenceStart = 0;
-                vadMonitorsRef.current[origTrack.id].speaking = true;
-                console.log(`VAD: student ${studentSocketId} started speaking (track ${origTrack.id}) rms=${rms}`);
-
-                // forward ORIGINAL track (or its clone) to all other student PCs
-                forwardTrackToAllExcept(studentSocketId, origTrack);
-              }
-            } else {
-              if (speaking) {
-                if (!silenceStart) silenceStart = now;
-                if (now - silenceStart > SILENCE_TIMEOUT) {
-                  // considered stopped
-                  speaking = false;
-                  vadMonitorsRef.current[origTrack.id].speaking = false;
-                  console.log(`VAD: student ${studentSocketId} stopped speaking (track ${origTrack.id})`);
-
-                  // remove forwarded copies of this track
-                  removeForwardedTrack(origTrack);
-                }
-              }
-            }
-          } catch (e) {
-            // analyser may throw if context closed
-            console.warn("VAD loop error", e);
-            break;
-          }
-
-          await new Promise((r) => setTimeout(r, POLL_INTERVAL));
-        }
-
-        try {
-          try { analyser.disconnect(); } catch (e) {}
-          try { source.disconnect(); } catch (e) {}
-          try { audioContext.close(); } catch (e) {}
-        } catch (e) {}
-      };
-
-      vadMonitorsRef.current[origTrack.id] = {
-        stop: () => {
-          running = false;
-          try { analyser.disconnect(); } catch (e) {}
-          try { source.disconnect(); } catch (e) {}
-          try { audioContext.close(); } catch (e) {}
-        },
-        speaking: false,
-        studentId: studentSocketId,
-      };
-
-      loop();
     };
 
     const setup = async () => {
@@ -462,29 +352,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             }
           });
 
-          // **NEW**: handle incoming teacher-initiated renegotiation offer
-          socket.on("incomingTeacherOffer", async ({ from: teacherSocketId, offer }, ack) => {
-            try {
-              console.log("incomingTeacherOffer from teacher:", teacherSocketId);
-              if (!pcRef.current) {
-                console.warn("Student PC not ready for incomingTeacherOffer");
-                if (ack) ack({ error: "pc-not-ready" });
-                return;
-              }
-
-              await pcRef.current.setRemoteDescription(offer);
-              const answer = await pcRef.current.createAnswer();
-              await pcRef.current.setLocalDescription(answer);
-
-              // return the answer via the ack callback
-              if (ack) ack(answer);
-              console.log("incomingTeacherOffer answered and acked");
-            } catch (e) {
-              console.warn("incomingTeacherOffer handler error", e);
-              if (ack) ack({ error: e.message });
-            }
-          });
-
           // Add local tracks to PC
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
@@ -522,9 +389,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
             const pc = new RTCPeerConnection(peerConfiguration);
             pcsRef.current[studentSocketId] = pc;
 
-            // negotiation guard
-            pc.__isNegotiating = false;
-
             // add teacher's local mic tracks to each pc (so students hear teacher)
             stream.getTracks().forEach((track) => {
               try {
@@ -553,40 +417,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
               });
             });
 
-            // onnegotiationneeded — create a re-offer and ask server to forward to specific student
-            pc.onnegotiationneeded = async () => {
-              if (!socketRef.current) return;
-              if (pc.__isNegotiating) return;
-              pc.__isNegotiating = true;
-              try {
-                console.log(`pc[${studentSocketId}] negotiationneeded — creating re-offer`);
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
-
-                socketRef.current.emit(
-                  "teacherReoffer",
-                  { targetId: studentSocketId, offer },
-                  async (answerOrErr) => {
-                    try {
-                      if (!answerOrErr || answerOrErr.error) {
-                        console.warn("teacherReoffer ack error:", answerOrErr);
-                        return;
-                      }
-                      // answerOrErr is student's RTCSessionDescription (answer)
-                      await pc.setRemoteDescription(answerOrErr);
-                      console.log(`pc[${studentSocketId}] remoteDescription (answer) set`);
-                    } catch (e) {
-                      console.warn("Error setting remoteDescription for re-offer answer", e);
-                    }
-                  }
-                );
-              } catch (e) {
-                console.warn("pc.onnegotiationneeded failed:", e);
-              } finally {
-                pc.__isNegotiating = false;
-              }
-            };
-
             pc.ontrack = (ev) => {
               console.log("teacher: ontrack from student", studentSocketId, ev);
               const shared = sharedStreamRef.current;
@@ -603,16 +433,11 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                     // Create mixed track: student + teacher audio
                     const mixedTrack = createMixedTrack(incomingTrack, stream.getAudioTracks()[0]);
 
-                    // forward the MIXED track to all other student PCs (legacy behaviour)
+                    // forward the MIXED track to all other student PCs
                     Object.keys(pcsRef.current).forEach((targetId) => {
                       if (targetId === studentSocketId) return;
                       forwardTrackToPc(mixedTrack, studentSocketId, targetId);
                     });
-
-                    // Start monitoring this incoming track for speech activity and forward ORIGINAL track when speaking
-                    try {
-                      monitorSpeaking(incomingTrack, studentSocketId);
-                    } catch (e) { console.warn('monitorSpeaking error', e); }
                   }
                 });
               } else {
@@ -626,16 +451,11 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                   // Create mixed track: student + teacher audio
                   const mixedTrack = createMixedTrack(t, stream.getAudioTracks()[0]);
 
-                  // forward the MIXED track to all other student PCs (legacy behaviour)
+                  // forward the MIXED track to all other student PCs
                   Object.keys(pcsRef.current).forEach((targetId) => {
                     if (targetId === studentSocketId) return;
                     forwardTrackToPc(mixedTrack, studentSocketId, targetId);
                   });
-
-                  // Start monitoring this incoming track for speech activity and forward ORIGINAL track when speaking
-                  try {
-                    monitorSpeaking(t, studentSocketId);
-                  } catch (e) { console.warn('monitorSpeaking error', e); }
                 }
               }
 
@@ -815,12 +635,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
                   sharedStreamRef.current.removeTrack(t);
                 } catch (e) { }
                 try { removeForwardedTrack(t); } catch (e) { }
-
-                // stop VAD monitors
-                try {
-                  const monitor = vadMonitorsRef.current[t.id];
-                  if (monitor && monitor.stop) monitor.stop();
-                } catch (e) { }
               });
             });
             studentTracksRef.current = {};
@@ -859,7 +673,6 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
         socketRef.current.off("answerResponse");
         socketRef.current.off("receivedIceCandidateFromServer");
         socketRef.current.off("roomClosed");
-        socketRef.current.off("incomingTeacherOffer");
       }
 
       if (pcRef.current) {
@@ -884,22 +697,10 @@ const AudioCall = ({ displayName, roomId, role = "student" }) => {
           } catch (e) { }
           try { removeForwardedTrack(t); } catch (e) { }
           try { t.stop?.(); } catch (e) { }
-
-          // stop VAD monitor
-          try {
-            const monitor = vadMonitorsRef.current[t.id];
-            if (monitor && monitor.stop) monitor.stop();
-          } catch (e) { }
         });
       });
       studentTracksRef.current = {};
       forwardedSendersRef.current = {};
-
-      // stop and clear VAD monitors map
-      try {
-        Object.values(vadMonitorsRef.current).forEach((m) => m.stop && m.stop());
-      } catch (e) { }
-      vadMonitorsRef.current = {};
 
       // clear and stop shared stream tracks
       try {
